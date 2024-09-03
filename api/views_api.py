@@ -12,6 +12,114 @@ from django.db.models import Q
 import copy
 from .views_front import *
 from django.utils.translation import gettext as _
+from django.conf import settings
+
+
+def _get_uid_by_username(username: str | int) -> int:
+    """
+    Get user ID by username.
+    args:
+        username: The username to be queried.
+    """
+    try:
+        uid = int(username)
+        if not UserProfile.check_if_user_exists_by_uid(uid):
+            uid = None
+    except:
+        uid = UserProfile.get_uid_by_username(username=username)
+    return uid
+
+
+def update_device_owner(rid: str, uuid: str, owner: str = None, add: bool = False, *args, **kwargs) -> RustDesDevice:
+    """
+    Update device owner.
+
+    Args:
+        rid: The device ID to be updated.
+        uuid: The device UUID to be updated.
+        owner: The owner to be set. If add is False, owner will be set to None.
+        add: If True, add owner; if False, remove owner by setting it to None.
+    """
+    if rid == '' and uuid == '':
+        return None
+    # If add is False, set owner to None, indicating the owner will be removed
+    if not add:
+        owner = ""
+    # Retrieve the device using both 'rid' and 'uuid' for filtering
+    device = RustDesDevice.update_device(rid=rid, uuid=uuid, owner=owner)
+    return device
+
+
+def _tag_list_to_str(tag_list: list[str]) -> str:
+    """
+    Convert a list of tags to a string.
+    """
+    tag_list = [x for x in tag_list if x != '']
+    return ",".join(tag_list)
+
+
+def _tag_str_to_list(tag_str: str) -> list[str]:
+    """
+    Convert a string of tags to a list.
+    """
+    tag_list = tag_str.split(',')
+    return [x for x in tag_list if x != '']
+
+
+def update_self_tag(username: str) -> RustDeskTag:
+    """
+    Update self tag.
+    """
+    uid = _get_uid_by_username(username=username)
+    if not uid:
+        return None
+    tag, created = RustDeskTag.objects.get_or_create(uid=uid, tag_name=settings.SELF_TAG_NAME)
+    tag.tag_color = settings.SELF_TAG_COLOR
+    tag.save()
+    return tag
+
+
+def update_self_devices_to_peers(username: str) -> None:
+    """
+    Update self devices to peers.
+    """
+    self_tag = update_self_tag(username=username)
+    if self_tag is None:
+        return None
+    username = UserProfile.get_username_by_uid(uid=self_tag.uid)
+    devices = RustDesDevice.get_devices_by_owner(owner=username)
+    for device in devices:
+        device: RustDesDevice = device
+        peer, created = RustDeskPeer.objects.get_or_create(uid=self_tag.uid, rid=device.rid)
+        peer.username = device.username
+        peer.hostname = device.hostname
+        peer.platform = device.os
+        tags = _tag_str_to_list(peer.tags)
+        if self_tag.tag_name not in tags:
+            tags.append(self_tag.tag_name)
+        peer.tags = _tag_list_to_str(tags)
+        peer.save()
+
+
+def delete_self_devices_from_peers(username: str) -> None:
+    """
+    When a user logs out, delete the devices from peers.
+    """
+    uid = _get_uid_by_username(username=username)
+    if not uid:
+        return None
+    peers = RustDeskPeer.get_peers_by_uid(uid=uid)
+    for peer in peers:
+        peer: RustDeskPeer = peer
+        tags = _tag_str_to_list(peer.tags)
+        if settings.SELF_TAG_NAME in tags:
+            if len(tags) == 1:
+                peer.delete()
+            else:
+                tags.remove(settings.SELF_TAG_NAME)
+                peer.tags = _tag_list_to_str(tags)
+                peer.rhash = ""
+                peer.save()
 
 
 def login(request):
@@ -19,9 +127,7 @@ def login(request):
     if request.method == 'GET':
         result['error'] = _('请求方式错误！请使用POST方式。')
         return JsonResponse(result)
-
     data = json.loads(request.body.decode())
-
     username = data.get('username', '')
     password = data.get('password', '')
     rid = data.get('id', '')
@@ -39,7 +145,8 @@ def login(request):
     user.rtype = rtype
     user.deviceInfo = json.dumps(deviceInfo)
     user.save()
-
+    update_device_owner(rid=rid, uuid=uuid, owner=username, add=True)
+    update_self_tag(username=username)
     token = RustDeskToken.objects.filter(Q(uid=user.id) & Q(username=user.username) & Q(rid=user.rid)).first()
 
     # 检查是否过期
@@ -84,6 +191,8 @@ def logout(request):
         token.delete()
 
     result = {'code': 1}
+    update_device_owner(rid=rid, uuid=uuid, owner=None, add=False)
+    delete_self_devices_from_peers(username=user.username)
     return JsonResponse(result)
 
 
@@ -120,8 +229,8 @@ def ab(request):
     if not token:
         result = {'error': _('拉取列表错误！')}
         return JsonResponse(result)
-
     if request.method == 'GET':
+        update_self_devices_to_peers(username=token.uid)
         result = {}
         uid = token.uid
         tags = RustDeskTag.objects.filter(Q(uid=uid))
@@ -135,13 +244,14 @@ def ab(request):
         peers = RustDeskPeer.objects.filter(Q(uid=uid))
         if peers:
             for peer in peers:
+                tags = _tag_str_to_list(peer.tags)
                 tmp = {
                     'id': peer.rid,
                     'username': peer.username,
                     'hostname': peer.hostname,
                     'alias': peer.alias,
                     'platform': peer.platform,
-                    'tags': peer.tags.split(','),
+                    'tags': tags,
                     'hash': peer.rhash,
                 }
                 peers_result.append(tmp)
@@ -180,6 +290,10 @@ def ab(request):
             RustDeskPeer.objects.filter(uid=token.uid).delete()
             newlist = []
             for one in peers:
+                tags = one['tags']
+                if settings.SELF_TAG_NAME in tags:
+                    tags.remove(settings.SELF_TAG_NAME)
+                tags_str = _tag_list_to_str(tags)
                 peer = RustDeskPeer(
                     uid=token.uid,
                     rid=one['id'],
@@ -187,13 +301,13 @@ def ab(request):
                     hostname=one['hostname'],
                     alias=one['alias'],
                     platform=one['platform'],
-                    tags=','.join(one['tags']),
+                    tags=tags_str,
                     rhash=one['hash'],
-
-
                 )
                 newlist.append(peer)
             RustDeskPeer.objects.bulk_create(newlist)
+            # update self devices to peers after updating the address book
+            update_self_devices_to_peers(username=token.uid)
 
     result = {
         'code': 102,
@@ -208,14 +322,14 @@ def ab_get(request):
     return ab(request)
 
 
-def sysinfo(request):
+def sysinfo(request) -> JsonResponse:
     # 客户端注册服务后，才会发送设备信息
     result = {}
     if request.method == 'GET':
         result['error'] = _('错误的提交方式！')
         return JsonResponse(result)
 
-    postdata = json.loads(request.body)
+    postdata: dict[str, str] = json.loads(request.body)
     device = RustDesDevice.objects.filter(Q(rid=postdata['id']) & Q(uuid=postdata['uuid'])).first()
     if not device:
         device = RustDesDevice(
@@ -270,7 +384,7 @@ def audit(request):
     elif audit_type == "close":
         ConnLog.objects.filter(Q(conn_id=postdata['conn_id'])).update(conn_end=datetime.datetime.now())
     elif 'is_file' in postdata:
-        print(postdata)
+        # print(postdata)
         files = json.loads(postdata['info'])['files']
         filesize = convert_filesize(int(files[0][1]))
         new_file_log = FileLog(
