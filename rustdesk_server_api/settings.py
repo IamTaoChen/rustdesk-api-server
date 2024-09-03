@@ -193,5 +193,5 @@ LOCALE_PATHS = (
 )
 
 
-SELF_TAG_NAME='self'
-SELF_TAG_COLOR=0xFF6A1B9A
+SELF_TAG_NAME = env.str("SELF_TAG_NAME", default="self")
+SELF_TAG_COLOR = env.int("SELF_TAG_COLOR", default=0xFF6A1B9A)
